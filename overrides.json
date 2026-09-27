@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Personal corrections for urdu-translit.",
+    "Key = the Roman English you type. Value = your preferred Urdu spelling(s),",
+    "best first. These win over the Google engine's suggestions and are merged",
+    "on top of the built-in fixes, so you only need to list what you want to change.",
+    "A string works too:  \"bhai\": \"بھائی\"",
+    "With SUPER+SHIFT+U the second entry is used, so keep alternatives in order."
+  ],
+  "me": [
+    "میں"
+  ],
+  "hu": [
+    "ہوں"
+  ],
+  "bhai": [
+    "بھائی",
+    "بھی"
+  ],
+  "hussain": [
+    "حسین"
+  ],
+  "ayesha": [
+    "عائشہ"
+  ],
+  "urdu": [
+    "اردو",
+    "اُردو"
+  ],
+  "bohot": [
+    "بہت",
+    "بھوت"
+  ],
+  "waalaikumassalam": [
+    "وعلیکم السلام",
+    "وَعَلَيْکُمُ السَّلام"
+  ],
+  "zorrr": [
+    "زور",
+    "زور زور"
+  ]
+}

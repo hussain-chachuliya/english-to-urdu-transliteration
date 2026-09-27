@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""urdu-translit - transliterate Roman-English text into Urdu script.
+
+Uses the same engine as engurdu.com / Google Input Tools
+(ime=transliteration_en_ur), which returns ranked suggestions per word.
+
+Modes
+  urdu-translit "aap kise hen"        transliterate an argument
+  echo "aap kise hen" | urdu-translit transliterate stdin
+  urdu-translit --clip                grab the focused app's selection,
+                                      transliterate, paste back in place
+  urdu-translit --clip --pick 2       use the 2nd suggestion for every word
+  urdu-translit --offline             cache only, never touch the network
+  urdu-translit --no-cache            bypass the cache for this run
+  urdu-translit --selftest            run the built-in accuracy check
+
+Punctuation follows Urdu convention: . -> ، ? -> ؟ ; -> ؛
+Digits are left as Latin unless --urdu-numbers is given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+API = "https://www.google.com/inputtools/request"
+IME = "transliteration_en_ur"
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "urdu-translit" / "cache.json"
+# Urdu text -> the Roman word it came from + that word's full suggestion list.
+# Written as words are transliterated so that pressing SUPER+SHIFT+U on text
+# that is *already* Urdu can offer the next spelling. Without it the second
+# keybind is a silent no-op on its own output: WORD_RE only matches Latin.
+REVERSE = CACHE.with_name("reverse.json")
+REVERSE_MAX = 2000  # entries kept; oldest insertions are dropped past this
+# Roman word -> the rank last used for it. This is what makes an alternate
+# stick: once you accept the 2nd suggestion for "thik", plain SUPER+U keeps
+# giving you that one instead of reverting to the top-ranked spelling. The
+# suggestion list in cache.json stays immutable; this only records where in
+# it you left off.
+PICKS = CACHE.with_name("picks.json")
+PICKS_MAX = 1000
+
+# Words the engine ranks poorly. User file: ~/.config/urdu-translit/overrides.json
+BUILTIN_OVERRIDES = {
+    "wo": ["وہ", "و", "وہوں"],
+    "woh": ["وہ"],
+    "hai": ["ہے", "ہےں", "ہوں"],
+    "hain": ["ہیں", "ہیں"],
+    "hen": ["ہیں", "ہن"],
+    "main": ["میں", "میں"],
+    "mein": ["میں", "میں"],
+}
+
+# Punctuation that should switch to its Urdu counterpart.
+PUNCT = {
+    ".": "۔",   # .
+    ",": "،",   # ,
+    ";": "؛",   # ;
+    "?": "؟",   # ?
+    "%": "٪",   # %
+}
+ARABIC_DIGITS = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)*")
+# A run of Urdu letters, including the Urdu-only ones (ٹ U+0679, ڈ U+0688,
+# ڑ U+0691, ژ U+0698, ں U+06BA, ہ U+06C1, ے U+06D2, ک U+06A9, گ U+06AF) and
+# ZWNJ/ZWJ, which join characters *inside* a word and must not split a
+# lookup. Written as escapes: the literal-glyph form is unreadable and easy
+# to corrupt. The ranges deliberately skip U+060C/061B/061F (Urdu punctuation
+# ، ؛ ؟) and U+0640 (tatweel), so a trailing comma stays outside the token -
+# a reverse-cache key never contains them, so including them would make every
+# lookup miss. The trailing + is what makes it match a whole word instead of
+# one character at a time.
+URDU_RE = re.compile(
+    "[\u0620-\u063F\u0641-\u065F\u066E-\u06D3\u06D5\u06F0-\u06FF"
+    "\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF"
+    "\u200C-\u200D]+")
+# Tokens we must never transliterate: URLs, emails, file paths, hex, versions.
+PROTECT_RE = re.compile(
+    r"(?:https?://|www\.|ftp://)\S+"
+    r"|\b[\w.+-]+@[\w-]+\.[\w.]+\b"
+    r"|\b(?:0x)?[0-9a-fA-F]{6,}\b"
+    r"|\bv?\d+(?:\.\d+)+\b"
+    r"|(?<!\w)/[^\s/]*/[^\s]*"
+)
+
+
+def log(msg: str) -> None:
+    print(f"urdu-translit: {msg}", file=sys.stderr)
+
+
+def notify(msg: str) -> None:
+    """Surface a problem as a desktop notification.
+
+    Hyprland binds discard the spawned process's stdout/stderr, so a plain
+    print() is invisible when a keybind fails. A notification is the only way
+    the user finds out something went wrong.
+    """
+    try:
+        subprocess.run(
+            ["notify-send", "--app-name=urdu-translit",
+             "--expire-time=6000", "urdu-translit", msg],
+            timeout=5, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def fail(msg: str, hint: str | None = None) -> int:
+    """Log a failure, notify about it, and return the exit code to use."""
+    log(msg)
+    notify(msg if hint is None else f"{msg}\n{hint}")
+    if hint:
+        log(hint)
+    return 1
+
+
+# --------------------------------------------------------------------------- cache
+
+
+def load_cache() -> dict:
+    try:
+        with CACHE.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_cache(cache: dict) -> None:
+    try:
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(cache, fh, ensure_ascii=False, indent=0, sort_keys=True)
+        tmp.replace(CACHE)
+    except OSError as exc:
+        log(f"could not write cache: {exc}")
+
+
+def load_reverse() -> dict:
+    """Urdu -> {word, rank, options}, for alternates on already-Urdu text."""
+    try:
+        with REVERSE.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_reverse(reverse: dict) -> None:
+    try:
+        if len(reverse) > REVERSE_MAX:
+            for key in list(reverse)[:len(reverse) - REVERSE_MAX]:
+                del reverse[key]
+        REVERSE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REVERSE.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(reverse, fh, ensure_ascii=False, indent=0, sort_keys=True)
+        tmp.replace(REVERSE)
+    except OSError as exc:
+        log(f"could not write reverse cache: {exc}")
+
+
+def load_picks() -> dict:
+    """Roman word -> remembered suggestion rank (0 = top-ranked)."""
+    try:
+        with PICKS.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, int) and v >= 0}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_picks(picks: dict) -> None:
+    try:
+        if len(picks) > PICKS_MAX:
+            for key in list(picks)[:len(picks) - PICKS_MAX]:
+                del picks[key]
+        PICKS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PICKS.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(picks, fh, ensure_ascii=False, indent=0, sort_keys=True)
+        tmp.replace(PICKS)
+    except OSError as exc:
+        log(f"could not write picks cache: {exc}")
+
+
+def load_overrides() -> dict:
+    """Built-in fixes, then anything in ~/.config/urdu-translit/overrides.json.
+
+    The user file is merged on top, so adding a single word does not
+    discard the built-in corrections.
+
+    A malformed file is *reported, not just logged*. This is the one input
+    a human hand-edits, so a stray comma is the likely failure - and JSON
+    gives no partial credit, meaning one typo silently throws away every
+    word in the file. Since a keybind discards stderr, a log() here is
+    invisible: the words just stop working with no explanation at all.
+    """
+    merged = {k.lower(): list(v) for k, v in BUILTIN_OVERRIDES.items()}
+    path = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "urdu-translit" / "overrides.json"
+
+    # install.sh can point this at the project copy with a symlink. A broken
+    # link (project moved, repo re-cloned elsewhere) raises FileNotFoundError
+    # on open(), which the handler below would treat as "no config at all" -
+    # silently dropping every correction. That is worth shouting about.
+    if path.is_symlink() and not path.exists():
+        target = os.readlink(path)
+        msg = f"overrides symlink is broken: {path} -> {target}"
+        log(msg)
+        notify(f"{msg}\nYour corrections are not being loaded. Re-run "
+               "./install.sh from the project directory, or replace the link "
+               "with a real file.")
+        return merged
+
+    try:
+        with path.open(encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for word, opts in data.items():
+                if str(word).startswith("_"):
+                    continue               # _comment and friends are not words
+                if isinstance(opts, str):
+                    opts = [opts]
+                if isinstance(opts, list) and opts:
+                    merged[str(word).lower()] = [str(o) for o in opts]
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        msg = f"ignoring bad overrides file {path}: {exc}"
+        log(msg)
+        notify(f"{msg}\nEvery word in it is being ignored, so corrections "
+               f"like 'me' will not apply. Check it with:\n"
+               f"  python3 -m json.tool {path}")
+    return merged
+
+
+# --------------------------------------------------------------------------- engine
+
+
+def fetch(word: str, num: int = 5, timeout: float = 12.0, retries: int = 2) -> list[str]:
+    """Return ranked Urdu suggestions for one Roman word."""
+    params = urllib.parse.urlencode(
+        {"ime": IME, "num": num, "cp": 0, "cs": 0,
+         "ie": "utf-8", "oe": "utf-8", "app": "jsapi", "text": word}
+    )
+    req = urllib.request.Request(f"{API}?{params}", headers={"User-Agent": UA})
+    last = None
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if not data or data[0] != "SUCCESS":
+                return []
+            return list(data[1][0][1])
+        except (urllib.error.URLError, TimeoutError, ValueError, IndexError, KeyError) as exc:
+            last = exc
+            if attempt < retries:
+                time.sleep(0.4 * (attempt + 1))
+    log(f"network failed for {word!r}: {last}")
+    return []
+
+
+def transliterate(text: str, cache: dict, overrides: dict, args,
+                 reverse: dict | None = None, picks: dict | None = None) -> str:
+    # Blank out regions that must survive untouched, then restore them.
+    holes: list[str] = []
+
+    def stash(match: re.Match) -> str:
+        holes.append(match.group(0))
+        return f"\x00{len(holes) - 1}\x00"
+
+    protected = PROTECT_RE.sub(stash, text)
+
+    # --- pass 1: resolve options for every word, batching the network calls ---
+    options: dict[str, list[str]] = {}
+    words = {m.group(0).lower() for m in WORD_RE.finditer(protected)}
+    pending: list[str] = []
+    for word in words:
+        opts = overrides.get(word)
+        if opts is None and not args.no_cache and word in cache:
+            hit = cache[word]
+            opts = [hit] if isinstance(hit, str) else list(hit)
+        if opts is None:
+            pending.append(word)
+        else:
+            options[word] = list(opts)
+
+    if pending and not args.offline:
+        workers = min(8, max(1, (os.cpu_count() or 2)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for word, opts in zip(pending, pool.map(fetch, pending)):
+                if opts:
+                    options[word] = opts
+
+    if not args.no_cache:
+        for word, opts in options.items():
+            if word not in overrides:
+                cache[word] = list(opts)
+
+    # --- pass 2: assemble the output ---
+    def convert_word(match: re.Match) -> str:
+        word = match.group(0).lower()
+        opts = options.get(word)
+        if not opts:
+            return match.group(0)          # unknown + offline: leave it alone
+        # An explicit --pick N above 1 is a deliberate choice: it overrides
+        # the remembered rank and becomes the new one. Plain SUPER+U (--pick 1)
+        # replays whatever rank this word was last converted at, so accepting
+        # an alternate once makes it stick. Words never seen before fall back
+        # to the top-ranked suggestion.
+        remembered = picks.get(word, 0) if picks is not None else 0
+        wanted = args.pick - 1 if args.pick > 1 else remembered
+        rank = min(max(wanted, 0), len(opts) - 1)
+        if picks is not None:
+            picks[word] = rank
+        chosen = opts[rank]
+        if reverse is not None:
+            # Remember what this Urdu came from, so selecting it later and
+            # pressing SUPER+SHIFT+U can step to the next spelling.
+            reverse[chosen] = {"word": word, "rank": rank, "options": list(opts)}
+        return chosen
+
+    converted = WORD_RE.sub(convert_word, protected)
+
+    # Punctuation and digits.
+    if args.keep_punct:
+        converted = re.sub(r"[.,;?%]", lambda m: m.group(0), converted)
+    else:
+        converted = re.sub(r"[.,;?%]", lambda m: PUNCT[m.group(0)], converted)
+    if args.urdu_numbers:
+        converted = converted.translate(ARABIC_DIGITS)
+
+    for idx, original in enumerate(holes):
+        converted = converted.replace(f"\x00{idx}\x00", original)
+    return converted
+
+
+def next_alternate(text: str, reverse: dict, pick: int,
+                   picks: dict | None = None) -> tuple[str, list[str], list[str]]:
+    """Step already-Urdu words to another spelling of the same Roman word.
+
+    This is what makes SUPER+SHIFT+U useful *after* SUPER+U has run: the
+    output is Urdu, which WORD_RE cannot transliterate, so without the
+    reverse index the second keybind was a silent no-op on its own output.
+
+    Each known Urdu word advances to the next entry in its suggestion list,
+    wrapping at the end, so repeated presses cycle through the alternates.
+    The new rank is written back to `picks`, so accepting an alternate here
+    also makes plain SUPER+U on the Roman word keep giving it.
+    Returns (new_text, changed_words, unknown_words).
+    """
+    changed: list[str] = []
+    unknown: list[str] = []
+
+    def swap(match: re.Match) -> str:
+        token = match.group(0)
+        entry = reverse.get(token)
+        opts = entry.get("options") if isinstance(entry, dict) else None
+        if not isinstance(opts, list) or len(opts) < 2:
+            unknown.append(token)
+            return token
+        rank = entry.get("rank", 0)
+        if not isinstance(rank, int) or not 0 <= rank < len(opts):
+            rank = 0
+        new_rank = (rank + max(pick - 1, 1)) % len(opts)
+        new_token = opts[new_rank]
+        # Re-point the index at the new spelling so the next press moves on
+        # from here instead of oscillating between the first two.
+        word = entry.get("word", "")
+        reverse[new_token] = {"word": word, "rank": new_rank, "options": list(opts)}
+        if picks is not None and word:
+            picks[word] = new_rank
+        changed.append(new_token)
+        return new_token
+
+    return URDU_RE.sub(swap, text), changed, unknown
+
+
+# --------------------------------------------------------------------------- wayland
+
+
+def wl_copy(text: str) -> None:
+    subprocess.run(["wl-copy", "--type", "text/plain;charset=utf-8"],
+                   input=text.encode("utf-8"), check=True)
+
+
+def wl_paste(primary: bool = False) -> str:
+    cmd = ["wl-paste", "--no-newline"]
+    if primary:
+        cmd.append("--primary")
+    out = subprocess.run(cmd, capture_output=True, check=True)
+    return out.stdout.decode("utf-8", "replace")
+
+
+def have_wtype() -> bool:
+    return subprocess.run(["sh", "-c", "command -v wtype"],
+                          capture_output=True).returncode == 0
+
+
+def send_ctrl(letter: str) -> None:
+    """Tap Ctrl+<letter> in the focused window."""
+    send_combo(("ctrl",), letter)
+
+
+def send_combo(mods: tuple[str, ...], key: str) -> None:
+    """Tap <mods>+<key> in the focused window.
+
+    wtype's -k/-P/-p take a single *key*; modifiers are only accepted by
+    -M/-m. So "wtype -k ctrl+c" fails with "Unknown key 'ctrl+c'" - the
+    modifier has to be raised with -M first and lowered with -m after.
+
+    The caller must make sure the keybind's own modifiers (SUPER, SHIFT)
+    have been released first: a synthetic key sent while SHIFT is still
+    physically held arrives with SHIFT attached, which most apps read as
+    a different shortcut entirely.
+    """
+    cmd = ["wtype", "-s", "20"]
+    for mod in mods:
+        cmd += ["-M", mod]
+    cmd += ["-k", key]
+    for mod in reversed(mods):
+        cmd += ["-m", mod]
+    subprocess.run(cmd, check=True)
+
+
+# Copy chords tried in order. Ctrl+C is the GUI convention; Ctrl+Shift+C is
+# what terminals bind to copy, because plain Ctrl+C there is SIGINT. A
+# terminal (or any TUI) silently fails the first one, which used to surface
+# as "nothing was selected" no matter how many times it was retried.
+COPY_CHORDS = (("ctrl",), ("ctrl", "shift"))
+
+# Timings for the keybind race. Both binds fire on key *press*, so when
+# do_clip() starts the user is still holding SUPER (SUPER+U) or SUPER+SHIFT
+# (SUPER+SHIFT+U). A 3-key chord takes longer to let go of, and a synthetic
+# key sent too early arrives with the held modifiers attached.
+COPY_SETTLE = 0.6    # wait this long after startup before the first Ctrl+C
+PASTE_SETTLE = 0.5   # and this long before the Ctrl+V paste-back
+COPY_TRIES = 3       # attempts per chord before moving to the next one
+
+
+def settle_until(start: float, delay: float) -> None:
+    """Sleep until `delay` seconds have elapsed since `start` (no-op if past)."""
+    remaining = start + delay - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def copy_selection(start: float) -> str:
+    """Return the focused app's selection, or "" if it cannot be read.
+
+    Tries the primary selection first (no key simulation, so no waiting),
+    then Ctrl+C, then Ctrl+Shift+C for terminals. The clipboard is cleared
+    before each attempt so a stale value cannot be mistaken for a fresh
+    copy, and restored untouched if every attempt comes back empty.
+    """
+    try:
+        primary = wl_paste(primary=True)
+    except (subprocess.CalledProcessError, OSError):
+        primary = ""
+    if primary.strip():
+        return primary
+
+    try:
+        old_clip = wl_paste()
+    except (subprocess.CalledProcessError, OSError):
+        old_clip = ""
+
+    for chord in COPY_CHORDS:
+        for attempt in range(COPY_TRIES):
+            subprocess.run(["wl-copy", "--clear"], capture_output=True)
+            settle_until(start, COPY_SETTLE + 0.3 * attempt)
+            try:
+                send_combo(chord, "c")
+            except (subprocess.CalledProcessError, OSError):
+                break        # wtype is broken; another chord won't help
+            time.sleep(0.2)
+            try:
+                copied = wl_paste()
+            except (subprocess.CalledProcessError, OSError):
+                copied = ""
+            if copied.strip():
+                return copied
+            # Nothing yet: the chord was probably still held, so the app
+            # saw the wrong shortcut. Wait it out and try again.
+            time.sleep(0.3)
+
+    if old_clip:
+        try:
+            wl_copy(old_clip)
+        except (subprocess.CalledProcessError, OSError):
+            pass
+    return ""
+
+
+def do_clip(args) -> int:
+    if not have_wtype():
+        return fail("wtype is not installed",
+                    "Install it: sudo pacman -S wtype")
+
+    # Let go of SUPER/SHIFT first: the keybind fires while they are still
+    # held, so a synthetic Ctrl+C sent immediately arrives with them
+    # attached (Super+Ctrl+C, or Ctrl+Shift+C for the SUPER+SHIFT+U chord)
+    # and the app ignores it - which is why a manual Ctrl+C used to be
+    # needed. The primary-selection read involves no key simulation, so it
+    # runs immediately; every synthetic key waits behind settle_until().
+    start = time.monotonic()
+
+    # 1. grab the selection (primary first, then a copy chord)
+    selected = copy_selection(start)
+    if not selected.strip():
+        tried = " and ".join("+".join(m.capitalize() for m in c) + "+C"
+                             for c in COPY_CHORDS)
+        return fail("nothing was selected",
+                    f"No selection, and neither copy chord worked (tried {tried}).\n"
+                    "Select and copy the text manually, then run it again: "
+                    "wl-paste --no-newline | urdu-translit | wl-copy")
+
+    # 2. transliterate - or, if the selection is already Urdu, offer the
+    #    next spelling of the word it came from.
+    cache = load_cache()
+    overrides = load_overrides()
+    reverse = load_reverse()
+    picks = None if args.no_cache else load_picks()
+
+    if URDU_RE.search(selected) and not WORD_RE.search(selected):
+        if args.pick < 2:
+            return fail("that text is already Urdu",
+                        "SUPER+SHIFT+U steps an Urdu word to its next "
+                        "spelling; plain SUPER+U converts Roman English.")
+        urdu, changed, unknown = next_alternate(selected, reverse, args.pick, picks)
+        if not changed:
+            return fail("no alternates known for that Urdu",
+                        f"{' '.join(unknown[:4])} was not produced by "
+                        "urdu-translit, so there is nothing to switch to.\n"
+                        "Re-select the original Roman English and press "
+                        "SUPER+SHIFT+U, or pin the word in "
+                        "~/.config/urdu-translit/overrides.json")
+        if not args.no_cache:
+            save_reverse(reverse)
+            save_picks(picks)
+    else:
+        urdu = transliterate(selected, cache, overrides, args,
+                             reverse=reverse, picks=picks)
+        if not args.no_cache:
+            save_cache(cache)
+            save_reverse(reverse)
+            save_picks(picks)
+
+    if urdu == selected:
+        log("nothing changed")
+        return 0
+
+    # 3. put it back where it came from
+    wl_copy(urdu)
+    # Let go of SUPER/SHIFT before pasting: a still-held SHIFT turns the
+    # synthetic Ctrl+V into Ctrl+Shift+V (paste-as-plain-text in browsers,
+    # Markdown preview in VS Code). Transliteration usually takes longer
+    # than this already, so the settle below is a no-op on slow runs.
+    settle_until(start, PASTE_SETTLE)
+    time.sleep(0.12)
+    try:
+        send_ctrl("v")
+    except (subprocess.CalledProcessError, OSError) as exc:
+        log(f"wtype could not send Ctrl+V: {exc}")
+        print(urdu)
+        return fail("could not paste back",
+                    f"The Urdu is on your clipboard - paste with Ctrl+V:\n{urdu}")
+    print(urdu)
+    return 0
+
+
+# --------------------------------------------------------------------------- self test
+
+
+def selftest() -> int:
+    cases = [
+        ("aap kise hen", "آپ کیسے ہیں"),
+        ("aap ko dekh kar bahat acha laga", "آپ کو دیکھ کر بہت اچھا لگا"),
+        ("salaam", "سلام"),
+        ("theek", "ٹھیک"),
+        ("shukriya", "شکریہ"),
+        ("zindagi", "زندگی"),
+        ("khushi", "خوشی"),
+        ("dost", "دوست"),
+        ("ghar", "گھر"),
+        ("ustad", "استاد"),
+    ]
+    cache, overrides = {}, load_overrides()
+    args = argparse.Namespace(pick=1, no_cache=True, offline=False,
+                              urdu_numbers=False, keep_punct=False)
+    passed = 0
+    for src, want in cases:
+        got = transliterate(src, cache, overrides, args)
+        ok = got == want
+        passed += ok
+        print(f"  {'PASS' if ok else 'FAIL'}  {src!r} -> {got!r}" + ("" if ok else f"  (want {want!r})"))
+    total = len(cases)
+
+    # Alternates: Roman -> Urdu, then step the Urdu to its next spelling.
+    # Needs no network, so it runs even with the cases above offline.
+    reverse: dict = {}
+    got = transliterate("theek", cache, overrides, args, reverse=reverse)
+    step, changed, _ = next_alternate(got, reverse, 2)
+    ok = got == "ٹھیک" and changed and step != got
+    passed += ok
+    print(f"  {'PASS' if ok else 'FAIL'}  alternate: {got!r} --pick 2 -> {step!r}")
+    total += 1
+
+    # An unknown Urdu word must be reported, not silently mangled.
+    _, changed, unknown = next_alternate("کیا", {}, 2)
+    ok = not changed and unknown == ["کیا"]
+    passed += ok
+    print(f"  {'PASS' if ok else 'FAIL'}  unknown Urdu left alone: {unknown}")
+    total += 1
+
+    # Punctuation must stay outside the token, or every lookup misses.
+    ok = URDU_RE.findall("ٹھیک، کیا؟") == ["ٹھیک", "کیا"]
+    passed += ok
+    print(f"  {'PASS' if ok else 'FAIL'}  Urdu tokenisation: {URDU_RE.findall('ٹھیک، کیا؟')}")
+    total += 1
+
+    # An accepted alternate must stick: after --pick 2, plain --pick 1 has to
+    # replay it rather than reverting to the top-ranked suggestion.
+    sticky: dict = {}
+    plain = argparse.Namespace(pick=1, no_cache=True, offline=False,
+                                urdu_numbers=False, keep_punct=False)
+    alt_arg = argparse.Namespace(pick=2, no_cache=True, offline=False,
+                                 urdu_numbers=False, keep_punct=False)
+    first = transliterate("theek", cache, overrides, plain, picks=sticky)
+    transliterate("theek", cache, overrides, alt_arg, picks=sticky)
+    again = transliterate("theek", cache, overrides, plain, picks=sticky)
+    ok = first == "ٹھیک" and again == "تھیک"
+    passed += ok
+    print(f"  {'PASS' if ok else 'FAIL'}  sticky pick: {first!r} -> --pick 2 -> --pick 1 -> {again!r}")
+    total += 1
+
+    print(f"\n{passed}/{total} passed")
+    return 0 if passed == total else 1
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(
+        prog="urdu-translit",
+        description="Transliterate Roman-English text into Urdu script.")
+    p.add_argument("text", nargs="*", help="text to transliterate")
+    p.add_argument("--clip", action="store_true",
+                   help="transliterate the focused app's selection in place")
+    p.add_argument("--pick", type=int, default=1, metavar="N",
+                   help="use the Nth suggestion; >1 also makes it the new "
+                        "default for that word. Default 1 replays the last "
+                        "rank used, or the top suggestion for a new word")
+    p.add_argument("--forget", metavar="WORD", nargs="?", const="*",
+                   help="forget the remembered suggestion for WORD, or for "
+                        "every word if given without one")
+    p.add_argument("--offline", action="store_true", help="cache only, no network")
+    p.add_argument("--no-cache", action="store_true", help="ignore the cache for this run")
+    p.add_argument("--keep-punct", action="store_true",
+                   help="leave . , ; ? as-is instead of Urdu punctuation")
+    p.add_argument("--urdu-numbers", action="store_true", help="convert digits to Urdu numerals")
+    p.add_argument("--selftest", action="store_true", help="run the accuracy self-test")
+    args = p.parse_args(argv)
+
+    if args.selftest:
+        return selftest()
+
+    if args.forget is not None:
+        picks = load_picks()
+        if args.forget == "*":
+            gone = len(picks)
+            picks.clear()
+        else:
+            gone = 1 if picks.pop(args.forget.lower(), None) is not None else 0
+        if not args.no_cache:
+            save_picks(picks)
+        print(f"forgot {gone} remembered pick(s)")
+        return 0
+
+    if args.clip:
+        return do_clip(args)
+
+    text = " ".join(args.text) if args.text else sys.stdin.read()
+    if not text.strip():
+        p.error("no input given")
+
+    cache = load_cache()
+    overrides = load_overrides()
+    reverse = load_reverse()
+    # picks.json is a cache like any other, so --no-cache ignores it
+    # entirely rather than only declining to write it.
+    picks = None if args.no_cache else load_picks()
+
+    if URDU_RE.search(text) and not WORD_RE.search(text):
+        if args.pick < 2:
+            p.error("input is already Urdu; use --pick 2 or higher to step "
+                    "to another spelling")
+        out, changed, unknown = next_alternate(text, reverse, args.pick, picks)
+        if not changed:
+            p.error("no alternates known for: " + " ".join(unknown[:8]))
+    else:
+        out = transliterate(text, cache, overrides, args,
+                            reverse=reverse, picks=picks)
+        if not args.no_cache:
+            save_cache(cache)
+            save_reverse(reverse)
+            save_picks(picks)
+
+    print(out)
+    if not args.no_cache:
+        save_reverse(reverse)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
