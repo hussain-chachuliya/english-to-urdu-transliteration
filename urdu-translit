@@ -7,8 +7,11 @@ Uses the same engine as engurdu.com / Google Input Tools
 Modes
   urdu-translit "aap kise hen"        transliterate an argument
   echo "aap kise hen" | urdu-translit transliterate stdin
-  urdu-translit --clip                grab the focused app's selection,
+  urdu-translit --clip                grab the line under the cursor,
                                       transliterate, paste back in place
+  urdu-translit --clip --selection-only
+                                      use the app's existing selection
+                                      instead (e.g. several lines)
   urdu-translit --clip --pick 2       use the 2nd suggestion for every word
   urdu-translit --offline             cache only, never touch the network
   urdu-translit --no-cache            bypass the cache for this run
@@ -27,6 +30,7 @@ import re
 import subprocess
 import sys
 import time
+import types
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -421,8 +425,8 @@ def send_ctrl(letter: str) -> None:
     send_combo(("ctrl",), letter)
 
 
-def send_combo(mods: tuple[str, ...], key: str) -> None:
-    """Tap <mods>+<key> in the focused window.
+def key_cmd(mods: tuple[str, ...], key: str) -> list[str]:
+    """The wtype argv for tapping <mods>+<key>.
 
     wtype's -k/-P/-p take a single *key*; modifiers are only accepted by
     -M/-m. So "wtype -k ctrl+c" fails with "Unknown key 'ctrl+c'" - the
@@ -439,7 +443,33 @@ def send_combo(mods: tuple[str, ...], key: str) -> None:
     cmd += ["-k", key]
     for mod in reversed(mods):
         cmd += ["-m", mod]
-    subprocess.run(cmd, check=True)
+    return cmd
+
+
+def send_combo(mods: tuple[str, ...], key: str) -> None:
+    """Tap <mods>+<key> in the focused window."""
+    subprocess.run(key_cmd(mods, key), check=True)
+
+
+def select_line() -> None:
+    """Select the line under the cursor, so --clip needs no prior selection.
+
+    Home then Shift+End is the one select-the-line gesture every text
+    widget agrees on: text fields, browsers, editors, chat apps.
+
+    Only non-destructive keys are used. Ctrl+K / Ctrl+U / Ctrl+W would eat
+    the line (or everything before it) instead of selecting it, and
+    destroying the text is the opposite of what this tool is for.
+
+    Not every app honours it - a terminal's readline binds Home to
+    beginning-of-line, which moves the caret without selecting anything,
+    and Shift+End has no binding there at all. The copy that follows is
+    verified against the clipboard rather than assumed, so an app that
+    ignores this simply falls through to the usual "nothing was selected"
+    error instead of transliterating a stale clipboard value.
+    """
+    send_combo((), "Home")
+    send_combo(("shift",), "End")
 
 
 # Copy chords tried in order. Ctrl+C is the GUI convention; Ctrl+Shift+C is
@@ -464,28 +494,14 @@ def settle_until(start: float, delay: float) -> None:
         time.sleep(remaining)
 
 
-def copy_selection(start: float) -> str:
-    """Return the focused app's selection, or "" if it cannot be read.
+def copy_chords(start: float, tries: int) -> str:
+    """Try each copy chord until the clipboard really has text, else "".
 
-    Tries the primary selection first (no key simulation, so no waiting),
-    then Ctrl+C, then Ctrl+Shift+C for terminals. The clipboard is cleared
-    before each attempt so a stale value cannot be mistaken for a fresh
-    copy, and restored untouched if every attempt comes back empty.
+    The clipboard is cleared before every attempt, so a stale value left
+    over from earlier cannot be mistaken for a fresh copy of the selection.
     """
-    try:
-        primary = wl_paste(primary=True)
-    except (subprocess.CalledProcessError, OSError):
-        primary = ""
-    if primary.strip():
-        return primary
-
-    try:
-        old_clip = wl_paste()
-    except (subprocess.CalledProcessError, OSError):
-        old_clip = ""
-
     for chord in COPY_CHORDS:
-        for attempt in range(COPY_TRIES):
+        for attempt in range(tries):
             subprocess.run(["wl-copy", "--clear"], capture_output=True)
             settle_until(start, COPY_SETTLE + 0.3 * attempt)
             try:
@@ -502,6 +518,55 @@ def copy_selection(start: float) -> str:
             # Nothing yet: the chord was probably still held, so the app
             # saw the wrong shortcut. Wait it out and try again.
             time.sleep(0.3)
+    return ""
+
+
+def grab_line(start: float) -> str:
+    """Select the line under the cursor and copy it, or "" if that fails.
+
+    Selecting before copying is the whole point. Asked to copy an unknown
+    selection, an app may answer with anything - a stale selection left
+    elsewhere in the window, a line from a transcript above the input, or
+    nothing - and there is no portable way to ask what it has selected right
+    now. Having chosen the text ourselves a moment earlier, the copy that
+    comes back can only be that text.
+    """
+    try:
+        select_line()
+    except (subprocess.CalledProcessError, OSError):
+        return ""           # wtype is broken; nothing can be typed at all
+    return copy_chords(start, 1)
+
+
+def grab_selection(start: float) -> str:
+    """Copy whatever the app currently has selected, or "" if it won't say.
+
+    Less certain than grab_line(), which is why it is opt-in: the answer is
+    verified to be fresh (the clipboard is cleared first) but not to be
+    yours. Use it for a selection you made deliberately, such as several
+    lines, where collapsing the selection is worse than the doubt.
+    """
+    return copy_chords(start, COPY_TRIES)
+
+
+def copy_selection(start: float, selection_only: bool = False) -> str:
+    """Return the text --clip should transliterate, or "" if it cannot be read.
+
+    Default grabs the line under the cursor; selection_only=True copies the
+    app's own selection instead. PRIMARY is deliberately never consulted: it
+    is a sticky mirror of the last text selected in any app, with no way to
+    ask whether it is still current, so it goes stale the moment the caret
+    moves on - and a stale hit silently transliterates and pastes text the
+    user never asked about.
+    """
+    try:
+        old_clip = wl_paste()
+    except (subprocess.CalledProcessError, OSError):
+        old_clip = ""
+
+    copied = grab_selection(start) if selection_only else grab_line(start)
+    if copied.strip():
+        return copied
 
     if old_clip:
         try:
@@ -525,13 +590,15 @@ def do_clip(args) -> int:
     start = time.monotonic()
 
     # 1. grab the selection (primary first, then a copy chord)
-    selected = copy_selection(start)
+    selected = copy_selection(start, selection_only=args.selection_only)
     if not selected.strip():
         tried = " and ".join("+".join(m.capitalize() for m in c) + "+C"
                              for c in COPY_CHORDS)
         return fail("nothing was selected",
-                    f"No selection, and neither copy chord worked (tried {tried}).\n"
-                    "Select and copy the text manually, then run it again: "
+                    "The line was selected (Home, Shift+End) but the app did "
+                    f"not copy it with either chord (tried {tried}).\n"
+                    "Some apps bind those keys to something else. Select the "
+                    "text manually, then run:\n"
                     "wl-paste --no-newline | urdu-translit | wl-copy")
 
     # 2. transliterate - or, if the selection is already Urdu, offer the
@@ -638,6 +705,81 @@ def selftest() -> int:
     print(f"  {'PASS' if ok else 'FAIL'}  Urdu tokenisation: {URDU_RE.findall('ٹھیک، کیا؟')}")
     total += 1
 
+    # Selecting the line for the user is done with keys that work in any
+    # text widget. Pin the exact argv: wtype sends whatever we name, so a
+    # typo here is a silently dead keygrab, and a destructive chord
+    # (Ctrl+K eats the line, Ctrl+U eats to line start) would eat the very
+    # text we were asked to transliterate.
+    grab = key_cmd((), "Home") + key_cmd(("shift",), "End")
+    ok = grab == ["wtype", "-s", "20", "-k", "Home",
+                  "wtype", "-s", "20", "-M", "shift", "-k", "End", "-m", "shift"]
+    passed += ok
+    print(f"  {'PASS' if ok else 'FAIL'}  line grab keys: {grab}")
+    total += 1
+
+    # The grab has to select the line *before* it asks for a copy, and must
+    # never read PRIMARY. An app asked to copy an unknown selection answers
+    # with whatever it feels like - a stale selection elsewhere in the
+    # window, a line from the transcript, nothing - and there is no portable
+    # way to ask what it has selected right now. PRIMARY is worse still: a
+    # sticky mirror of the last selection in any app, which goes stale as
+    # soon as the caret moves on. Choosing the text ourselves first is the
+    # only way to know the answer is the text we meant.
+    class _FakeTime:
+        monotonic = staticmethod(lambda: 1000.0)
+
+        @staticmethod
+        def sleep(_seconds):
+            pass
+
+    app = {"selection": "", "keys": [], "primary": 0}
+
+    def fake_paste(primary=False):
+        if primary:
+            app["primary"] += 1
+        return app["selection"]
+
+    def fake_combo(mods, key):
+        app["keys"].append(key)
+        if key == "End":            # our own Home+Shift+End just landed
+            app["selection"] = "theek ho?"
+
+    real = {name: getattr(sys.modules[__name__], name)
+            for name in ("time", "wl_paste", "wl_copy", "send_combo", "subprocess")}
+    shim = types.SimpleNamespace(
+        run=lambda *a, **k: None,
+        CalledProcessError=real["subprocess"].CalledProcessError,
+        SubprocessError=real["subprocess"].SubprocessError)
+    try:
+        sys.modules[__name__].time = _FakeTime
+        sys.modules[__name__].wl_paste = fake_paste
+        sys.modules[__name__].wl_copy = lambda text: None
+        sys.modules[__name__].send_combo = fake_combo
+        sys.modules[__name__].subprocess = shim
+
+        app.update(selection="", keys=[], primary=0)
+        grabbed = copy_selection(start=1000.0)
+        ok = (app["primary"] == 0 and app["keys"] == ["Home", "End", "c"]
+              and grabbed == "theek ho?")
+        passed += ok
+        print(f"  {'PASS' if ok else 'FAIL'}  grabs the line it selected itself: "
+              f"primary_reads={app['primary']} keys={app['keys']} -> {grabbed!r}")
+        total += 1
+
+        # --selection-only is the deliberate multi-line case: the app
+        # already has the text, so it must be copied without our keys
+        # landing in the document and collapsing the selection first.
+        app.update(selection="salaam bhai", keys=[], primary=0)
+        picked = copy_selection(start=1000.0, selection_only=True)
+        ok = app["keys"] == ["c"] and picked == "salaam bhai"
+        passed += ok
+        print(f"  {'PASS' if ok else 'FAIL'}  --selection-only copies without "
+              f"disturbing it: keys={app['keys']} -> {picked!r}")
+        total += 1
+    finally:
+        for name, value in real.items():
+            setattr(sys.modules[__name__], name, value)
+
     # An accepted alternate must stick: after --pick 2, plain --pick 1 has to
     # replay it rather than reverting to the top-ranked suggestion.
     sticky: dict = {}
@@ -666,7 +808,10 @@ def main(argv: list[str] | None = None) -> int:
         description="Transliterate Roman-English text into Urdu script.")
     p.add_argument("text", nargs="*", help="text to transliterate")
     p.add_argument("--clip", action="store_true",
-                   help="transliterate the focused app's selection in place")
+                   help="transliterate the line under the cursor in place")
+    p.add_argument("--selection-only", action="store_true",
+                   help="with --clip, copy the app's existing selection instead "
+                        "of the line - for a deliberate multi-line selection")
     p.add_argument("--pick", type=int, default=1, metavar="N",
                    help="use the Nth suggestion; >1 also makes it the new "
                         "default for that word. Default 1 replays the last "
