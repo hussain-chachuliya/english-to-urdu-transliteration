@@ -451,6 +451,19 @@ def send_combo(mods: tuple[str, ...], key: str) -> None:
     subprocess.run(key_cmd(mods, key), check=True)
 
 
+def select_word() -> None:
+    """Select the single word under the cursor.
+
+    Ctrl+Left lands at the start of the current word, Ctrl+Shift+Right
+    selects to its end. Works in text fields, browsers, editors; falls back
+    gracefully if the app ignores it (copy will be empty and caller tries
+    next strategy).
+    """
+    send_combo(("ctrl",), "Left")
+    time.sleep(0.05)
+    send_combo(("ctrl", "shift"), "Right")
+
+
 def select_line() -> None:
     """Select the line under the cursor, so --clip needs no prior selection.
 
@@ -521,6 +534,15 @@ def copy_chords(start: float, tries: int) -> str:
     return ""
 
 
+def grab_word(start: float) -> str:
+    """Select the single word under the cursor and copy it, or "" if that fails."""
+    try:
+        select_word()
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+    return copy_chords(start, 1)
+
+
 def grab_line(start: float) -> str:
     """Select the line under the cursor and copy it, or "" if that fails.
 
@@ -549,22 +571,45 @@ def grab_selection(start: float) -> str:
     return copy_chords(start, COPY_TRIES)
 
 
-def copy_selection(start: float, selection_only: bool = False) -> str:
+def copy_selection(start: float, selection_only: bool = False, word_only: bool = False) -> str:
     """Return the text --clip should transliterate, or "" if it cannot be read.
 
     Default grabs the line under the cursor; selection_only=True copies the
-    app's own selection instead. PRIMARY is deliberately never consulted: it
-    is a sticky mirror of the last text selected in any app, with no way to
-    ask whether it is still current, so it goes stale the moment the caret
-    moves on - and a stale hit silently transliterates and pastes text the
-    user never asked about.
+    app's own selection instead; word_only=True grabs the single word under
+    the cursor. PRIMARY is deliberately never consulted: it is a sticky
+    mirror of the last text selected in any app, with no way to ask whether
+    it is still current, so it goes stale the moment the caret moves on -
+    and a stale hit silently transliterates and pastes text the user never
+    asked about.
     """
     try:
         old_clip = wl_paste()
     except (subprocess.CalledProcessError, OSError):
         old_clip = ""
 
-    copied = grab_selection(start) if selection_only else grab_line(start)
+    if word_only:
+        # Prefer explicit single-word selection. Probe quickly (1 try) so we
+        # don't collapse it with Ctrl+Left; only auto-select word under cursor
+        # if nothing single was selected.
+        probed = copy_chords(start, 1)
+        single = False
+        if probed.strip():
+            tokens = URDU_RE.findall(probed) or WORD_RE.findall(probed)
+            single = len(tokens) == 1 and "\n" not in probed
+        if single:
+            copied = probed
+        else:
+            # No single selection -> grab word under cursor (Home combi would
+            # grab whole line, which we don't want in word mode).
+            copied = grab_word(start)
+            if not copied.strip() and probed.strip():
+                # word keys ignored (terminal) but user had multi-word
+                # selection - keep it rather than failing
+                copied = probed
+    elif selection_only:
+        copied = grab_selection(start)
+    else:
+        copied = grab_line(start)
     if copied.strip():
         return copied
 
@@ -590,7 +635,8 @@ def do_clip(args) -> int:
     start = time.monotonic()
 
     # 1. grab the selection (primary first, then a copy chord)
-    selected = copy_selection(start, selection_only=args.selection_only)
+    selected = copy_selection(start, selection_only=args.selection_only,
+                              word_only=getattr(args, "word", False))
     if not selected.strip():
         tried = " and ".join("+".join(m.capitalize() for m in c) + "+C"
                              for c in COPY_CHORDS)
@@ -812,6 +858,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--selection-only", action="store_true",
                    help="with --clip, copy the app's existing selection instead "
                         "of the line - for a deliberate multi-line selection")
+    p.add_argument("--word", action="store_true",
+                   help="with --clip, operate on the single word under the "
+                        "cursor instead of the whole line")
     p.add_argument("--pick", type=int, default=1, metavar="N",
                    help="use the Nth suggestion; >1 also makes it the new "
                         "default for that word. Default 1 replays the last "
